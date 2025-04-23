@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Document RAG System</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        body {
+            background-color: #f7f7f8;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        .chat-container {
+            height: calc(100vh - 180px);
+            background-color: white;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            display: flex;
+            flex-direction: column;
+        }
+        .chat-messages {
+            flex-grow: 1;
+            overflow-y: auto;
+            padding: 20px;
+        }
+        .message {
+            margin-bottom: 20px;
+            max-width: 90%;
+        }
+        .user-message {
+            background-color: #eff6ff;
+            color: #1a56db;
+            align-self: flex-end;
+            border-radius: 15px 15px 0 15px;
+            padding: 12px 16px;
+        }
+        .bot-message {
+            background-color: #f9fafb;
+            border: 1px solid #e5e7eb;
+            color: #111827;
+            align-self: flex-start;
+            border-radius: 15px 15px 15px 0;
+            padding: 12px 16px;
+        }
+        .chat-input-container {
+            padding: 15px;
+            border-top: 1px solid #e5e7eb;
+            background-color: white;
+            border-radius: 0 0 10px 10px;
+        }
+        .upload-container {
+            padding: 20px;
+            background-color: white;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            margin-bottom: 20px;
+        }
+        .dropzone {
+            border: 2px dashed #ccc;
+            border-radius: 5px;
+            padding: 30px;
+            text-align: center;
+            cursor: pointer;
+            transition: border 0.3s;
+        }
+        .dropzone:hover, .dropzone.dragover {
+            border-color: #10B981;
+        }
+        .file-list {
+            margin-top: 15px;
+        }
+        .file-item {
+            display: flex;
+            align-items: center;
+            padding: 8px;
+            background-color: #f3f4f6;
+            margin-bottom: 5px;
+            border-radius: 5px;
+        }
+        .typing-indicator {
+            display: inline-flex;
+            align-items: center;
+            margin-left: 5px;
+        }
+        .typing-dot {
+            width: 8px;
+            height: 8px;
+            background-color: #10B981;
+            border-radius: 50%;
+            margin: 0 2px;
+            animation: typing 1s infinite;
+        }
+        .typing-dot:nth-child(2) {
+            animation-delay: 0.2s;
+        }
+        .typing-dot:nth-child(3) {
+            animation-delay: 0.4s;
+        }
+        @keyframes typing {
+            0%, 100% { transform: translateY(0); }
+            50% { transform: translateY(-5px); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container py-4">
+        <div class="row mb-4">
+            <div class="col-12">
+                <h1 class="text-center fw-bold text-primary">Document RAG Assistant</h1>
+                <p class="text-center text-muted">Upload files and ask questions about your data</p>
+            </div>
+        </div>
+
+        <div class="row">
+            <div class="col-lg-4 mb-4">
+                <div class="upload-container">
+                    <h5 class="mb-3"><i class="fas fa-cloud-upload-alt me-2"></i>Upload Files</h5>
+                    <form id="upload-form" enctype="multipart/form-data">
+                        <div id="dropzone" class="dropzone">
+                            <i class="fas fa-file-upload fs-3 mb-2 text-muted"></i>
+                            <p class="mb-2">Drag and drop files here or click to upload</p>
+                            <p class="text-muted small">Supports PDF, TXT, DOCX, PPTX, JPG, CSV, XLSX, JSON</p>
+                            <input type="file" id="file-input" multiple style="display: none;">
+                            <button type="button" id="upload-btn" class="btn btn-primary mt-2">Select Files</button>
+                        </div>
+                    </form>
+                    <div class="file-list mt-3">
+                        <h6 class="mb-2">Uploaded Files</h6>
+                        <div id="file-list-container"></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="col-lg-8">
+                <div class="chat-container">
+                    <div class="chat-messages" id="chat-messages">
+                        <div class="d-flex mb-4">
+                            <div class="bot-message">
+                                Hello! Upload some documents and ask me questions about them.
+                            </div>
+                        </div>
+                    </div>
+                    <div class="chat-input-container">
+                        <form id="query-form">
+                            <div class="input-group">
+                                <input type="text" id="query-input" class="form-control" placeholder="Ask a question about your documents...">
+                                <button class="btn btn-primary" type="submit">
+                                    <i class="fas fa-paper-plane"></i>
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            const dropzone = document.getElementById('dropzone');
+            const fileInput = document.getElementById('file-input');
+            const uploadBtn = document.getElementById('upload-btn');
+            const fileListContainer = document.getElementById('file-list-container');
+            const uploadForm = document.getElementById('upload-form');
+            const queryForm = document.getElementById('query-form');
+            const queryInput = document.getElementById('query-input');
+            const chatMessages = document.getElementById('chat-messages');
+            
+            // Handle file selection via button
+            uploadBtn.addEventListener('click', () => {
+                fileInput.click();
+            });
+            
+            // Handle file selection change
+            fileInput.addEventListener('change', () => {
+                handleFiles(fileInput.files);
+            });
+            
+            // Handle drag and drop
+            dropzone.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                dropzone.classList.add('dragover');
+            });
+            
+            dropzone.addEventListener('dragleave', () => {
+                dropzone.classList.remove('dragover');
+            });
+            
+            dropzone.addEventListener('drop', (e) => {
+                e.preventDefault();
+                dropzone.classList.remove('dragover');
+                handleFiles(e.dataTransfer.files);
+            });
+            
+            function handleFiles(files) {
+                if (files.length === 0) return;
+                
+                const formData = new FormData();
+                
+                for (const file of files) {
+                    formData.append('files[]', file);
+                    
+                    // Add to UI file list
+                    const fileItem = document.createElement('div');
+                    fileItem.className = 'file-item';
+                    fileItem.innerHTML = `
+                        <i class="fas fa-file me-2"></i>
+                        <span>${file.name}</span>
+                        <span class="ms-auto badge bg-secondary">${formatFileSize(file.size)}</span>
+                    `;
+                    fileListContainer.appendChild(fileItem);
+                }
+                
+                // Show loading indicator
+                const loadingMessage = addBotMessage('Processing your files... This may take a moment.');
+                
+                // Upload files
+                fetch('/upload', {
+                    method: 'POST',
+                    body: formData
+                })
+                .then(response => response.json())
+                .then(data => {
+                    // Remove loading message
+                    loadingMessage.remove();
+                    
+                    // Show success message
+                    addBotMessage(`Successfully processed ${data.uploads.length} files. You can now ask questions about them.`);
+                })
+                .catch(error => {
+                    // Remove loading message
+                    loadingMessage.remove();
+                    
+                    // Show error message
+                    addBotMessage('Error processing files. Please try again.');
+                    console.error('Error:', error);
+                });
+                
+                // Reset file input
+                fileInput.value = null;
+            }
+            
+            // Handle query submission
+            queryForm.addEventListener('submit', (e) => {
+                e.preventDefault();
+                
+                const question = queryInput.value.trim();
+                if (!question) return;
+                
+                // Add user message
+                addUserMessage(question);
+                
+                // Add typing indicator
+                const typingIndicator = addTypingIndicator();
+                
+                // Clear input
+                queryInput.value = '';
+                
+                // Submit query
+                fetch('/query', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ question })
+                })
+                .then(response => response.json())
+                .then(data => {
+                    // Remove typing indicator
+                    typingIndicator.remove();
+                    
+                    // Add bot response
+                    addBotMessage(data.answer);
+                })
+                .catch(error => {
+                    // Remove typing indicator
+                    typingIndicator.remove();
+                    
+                    // Show error message
+                    addBotMessage('Error processing your question. Please try again.');
+                    console.error('Error:', error);
+                });
+            });
+            
+            // Utility functions
+            function formatFileSize(bytes) {
+                if (bytes < 1024) return bytes + ' B';
+                else if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+                else if (bytes < 1073741824) return (bytes / 1048576).toFixed(1) + ' MB';
+                else return (bytes / 1073741824).toFixed(1) + ' GB';
+            }
+            
+            function addUserMessage(text) {
+                const messageDiv = document.createElement('div');
+                messageDiv.className = 'd-flex justify-content-end mb-4';
+                messageDiv.innerHTML = `
+                    <div class="user-message">
+                        ${text}
+                    </div>
+                `;
+                chatMessages.appendChild(messageDiv);
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+                return messageDiv;
+            }
+            
+            function addBotMessage(text) {
+                const messageDiv = document.createElement('div');
+                messageDiv.className = 'd-flex mb-4';
+                messageDiv.innerHTML = `
+                    <div class="bot-message">
+                        ${text}
+                    </div>
+                `;
+                chatMessages.appendChild(messageDiv);
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+                return messageDiv;
+            }
+            
+            function addTypingIndicator() {
+                const messageDiv = document.createElement('div');
+                messageDiv.className = 'd-flex mb-4';
+                messageDiv.innerHTML = `
+                    <div class="bot-message">
+                        Thinking
+                        <div class="typing-indicator">
+                            <div class="typing-dot"></div>
+                            <div class="typing-dot"></div>
+                            <div class="typing-dot"></div>
+                        </div>
+                    </div>
+                `;
+                chatMessages.appendChild(messageDiv);
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+                return messageDiv;
+            }
+        });
+    </script>
+</body>
+</html> 

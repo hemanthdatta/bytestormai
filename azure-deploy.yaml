@@ -1,0 +1,24 @@
+apiVersion: 2019-12-01
+location: <azure_region>
+name: multimodal-app
+properties:
+  containers:
+  - name: multimodal-app
+    properties:
+      image: <your_acr_name>.azurecr.io/multimodal-app:latest
+      resources:
+        requests:
+          cpu: 1.0
+          memoryInGB: 2.0
+      ports:
+      - port: 8000
+      environmentVariables:
+      - name: FLASK_ENV
+        value: "production"
+  ipAddress:
+    type: Public
+    ports:
+    - port: 8000
+  osType: Linux
+tags: null
+type: Microsoft.ContainerInstance/containerGroups 
