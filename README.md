@@ -21,7 +21,7 @@ A web application that allows users to upload documents and ask questions about 
 3. **Set environment variables**:
    ```bash
    export MISTRAL_API_KEY=your_mistral_api_key
-   export GEMINI_API_KEY=your_gemini_api_key            # used for ocr
+   export GEMINI_API_KEY=your_gemini_api_key            # Optional, used for document processing
    export ANTHROPIC_API_KEY=your_anthropic_api_key      # Required for Claude model-based answering
    export VOYAGE_API_KEY=your_voyage_api_key            # Required for Voyage embedding model
    ```
@@ -63,6 +63,32 @@ The application uses a Flask web server with the following components:
 ## Deployment
 
 This project is deployed as a live website through **Azure Web App**, allowing users to interact with the Document RAG Assistant directly from their browser.
+
+## Pipeline Overview
+
+When documents are ingested, they are first converted into chunks and then stored in different embedding stores:
+
+- **Text Embeddings**: Chunks of the document are embedded using the Voyage API and indexed in FAISS for semantic search.
+- **Structured Data**: Tables and spreadsheets are loaded into pandas DataFrames and saved in an SQLite database for SQL-based retrieval.
+- **Entity Graph**: Named entities are extracted via spaCy and stored in Neo4j as a graph for entity-centric queries.
+
+At query time, the following steps occur:
+
+1. **Classification**: The user’s question is classified into one of five routes (ENTITY, DATA, GENERAL, DETAILED, VAGUE).
+2. **Retrieval**: Based on the route:
+   - ENTITY → section-level FAISS search
+   - DATA   → SQL query or pandas-agent fallback
+   - GENERAL/DETAILED → section/paragraph FAISS search
+3. **Link Handling**: Any URLs embedded in documents are summarized and embedded so their context contributes to retrieval; if a link is relevant, its full text is fetched and passed to the model.
+4. **Answer Generation**: The retrieved context is combined into a prompt and sent to the Claude model for final answer synthesis.
+
+## Limitations
+
+- **Latency**: Processing large documents (chunking, embedding, entity extraction) can be time-consuming.
+- **URL Summarization**: Fetching and summarizing external links adds additional delay.
+- **API Dependencies**: Multiple external API calls (Voyage embeddings, Anthropic completions) are subject to rate limits and network latency.
+- **English Only**: The system currently supports English-language documents and queries.
+- **Resource Usage**: Embeddings and graph storage can consume significant compute and memory for large corpora.
 
 ## Purpose
 
