@@ -15,6 +15,12 @@ properties:
       environmentVariables:
       - name: FLASK_ENV
         value: "production"
+      - name: ANTHROPIC_API_KEY
+        secureValue: "@Microsoft.KeyVault(SecretUri=https://<your-keyvault-name>.vault.azure.net/secrets/ANTHROPIC-API-KEY/)"
+      - name: GEMINI_API_KEY
+        secureValue: "@Microsoft.KeyVault(SecretUri=https://<your-keyvault-name>.vault.azure.net/secrets/GEMINI-API-KEY/)"
+      - name: MISTRAL_API_KEY
+        secureValue: "@Microsoft.KeyVault(SecretUri=https://<your-keyvault-name>.vault.azure.net/secrets/MISTRAL-API-KEY/)"
   ipAddress:
     type: Public
     ports:

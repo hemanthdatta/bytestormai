@@ -33,6 +33,7 @@ anthropic_api_key = 'sk-ant-api03-evr-BDPDXkes5zQ9X4ssplI3moVYom28GudhR8zWiJD-nj
 anthropic = Anthropic(api_key=anthropic_api_key)
 gemini_api = os.getenv('GEMINI_API_KEY', 'AIzaSyBS2npulOMMZ9WRj7b-UpoYHXVSa0Jju4o')
 mistral_api_key = os.getenv('MISTRAL_API_KEY', 'VrAMhIHO61FjHTAYeibtLmla52bWnorV')
+voyage_api_key = os.getenv('VOYAGE_API_KEY', 'pa-RofV7BIpsxPQxTiGqbuMA18pw6tZYVSl-1h7zwrYoGJ')
 
 # Globals for structured data
 structured_index = None
