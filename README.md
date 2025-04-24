@@ -65,6 +65,8 @@ The application uses a Flask web server with the following components:
 This project is deployed as a live website through **Azure Web App**, allowing users to interact with the Document RAG Assistant directly from their browser.
 
 ## Pipeline Overview
+![image](https://github.com/user-attachments/assets/4d99432e-4f1e-4a98-9a53-53aef838af99)
+
 
 When documents are ingested, they are first converted into chunks and then stored in different embedding stores:
 
