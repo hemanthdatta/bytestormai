@@ -1,4 +1,5 @@
 import os
+import anthropic
 import faiss
 import numpy as np
 import pickle
@@ -9,6 +10,8 @@ from posthog import api_key
 import spacy
 from tqdm import tqdm
 from mistralai import Mistral
+from anthropic import Anthropic
+import voyageai
 from typing import List, Dict, Any, Tuple, Union
 from neo4j import GraphDatabase
 import hashlib
@@ -23,77 +26,77 @@ Chunk = Dict[str, Any]
 
 # Constants
 mistral_api_key = 'VrAMhIHO61FjHTAYeibtLmla52bWnorV'
-DEFAULT_CHUNK_SIZE = 500  # Target number of words per chunk
-MAX_TOKENS_BEFORE_SECTION_SPLIT = 5000  # Max tokens before splitting by section
+anthropic_api_key = "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"
+voyage_api_key    = "pa-RofV7BIpsxPQxTiGqbuMA18pw6tZYVSl-1h7zwrYoGJ"
+
+# Constants
+DEFAULT_CHUNK_SIZE = 500
+MAX_TOKENS_BEFORE_SECTION_SPLIT = 5000
 URL_REGEX = r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+'
-MD_URL_REGEX = r'<<(https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+)>>'  # Format: <<url>>
+MD_URL_REGEX = r'<<(https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+)>>'
 SIMPLIFIED_URL = r'<<.*?>>'
-# Initialize spaCy model - download with: python -m spacy download en_core_web_sm
+DB_PATH = "url_cache.db"
+
+# Initialize spaCy
 try:
     nlp = spacy.load("en_core_web_sm")
 except OSError:
-    print("SpaCy model not found. Please download it with: python -m spacy download en_core_web_sm")
+    print("Download spaCy model: python -m spacy download en_core_web_sm")
     nlp = None
 
 
 def tag_visible(element):
-    # Filter out unwanted elements
     if element.parent.name in ['style', 'script', 'head', 'title', 'meta', '[document]']:
         return False
     if isinstance(element, Comment):
         return False
     return True
 
-def extract_visible_text(url):
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-        }
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        
-        soup = BeautifulSoup(response.content, 'lxml')
 
-        # Remove scripts, styles, etc. completely
+def extract_visible_text(url: str) -> str:
+    try:
+        resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'})
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.content, 'lxml')
         for tag in soup(['script', 'style', 'head', 'meta', 'noscript']):
             tag.decompose()
-
-        # Get all text and filter
         texts = soup.find_all(string=True)
-        visible_texts = filter(tag_visible, texts)
-
-        # Join and clean text
-        return '\n'.join(t.strip() for t in visible_texts if t.strip())
-
+        visible = filter(tag_visible, texts)
+        return '\n'.join(t.strip() for t in visible if t.strip())
     except Exception as e:
         return f"Error: {e}"
 
+
 class Summarizer:
-    def __init__(self, api):
-        self.model = Mistral(api_key=api)
-        self.system_prompt = '''
-Summarise the given context of some web page into a description of 3 to 4 line paragraph.
-'''
+    def __init__(self,
+                 model: str = 'claude-3-haiku-20240307',
+                 max_retries: int = 5,
+                 retry_delay: float = 0.01):
+        self.client = Anthropic(api_key=anthropic_api_key)
+        self.model = model
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
+        self.system_prompt = "Summarise the given context into a 3-4 line paragraph."
 
-    def summarise_text(self, text):
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": text}
-        ]
-        for _ in range(3):  # retry up to 3 times
+    def summarise_text(self, text: str) -> str:
+        # Use top-level 'system' parameter instead of role in messages
+        for attempt in range(self.max_retries):
             try:
-                response = self.model.chat.complete(
-                    model='mistral-small-latest',
-                    messages=messages
+                response = self.client.messages.create(
+                    model=self.model,
+                    system=self.system_prompt,
+                    messages=[{"role": "user", "content": text}],
+                    max_tokens=200
                 )
-                time.sleep(1)
-                return response.choices[0].message.content
+                print(f"Summarizer response: {response.content[0].text}")
+                return str(response.content[0])
             except Exception as e:
-                print(f"Retrying due to error: {e}")
-                time.sleep(1)
-        return "Failed to generate summary after retries."
-
-summarizer = Summarizer(api = mistral_api_key)
+                print(f"Summarizer retry {attempt+1}/{self.max_retries} failed: {e}")
+                if attempt < self.max_retries - 1:
+                    time.sleep(self.retry_delay)
+        return "[Summary failed]"
+    
+summarizer = Summarizer()
 
 SIMPLIFIED_URL = r"<<[^<>]+>>"
 DB_PATH = "url_cache.db"
@@ -184,6 +187,77 @@ class Neo4jConnector:
         """Close the Neo4j connection."""
         if self.driver:
             self.driver.close()
+    
+    def clear_all_data(self):
+        """
+        Clear all data from the Neo4j database.
+        This removes all nodes and relationships.
+        
+        Returns:
+            bool: Success status
+        """
+        if not self.driver:
+            print("No Neo4j connection available.")
+            return False
+            
+        try:
+            with self.driver.session() as session:
+                # Delete all relationships first
+                session.run("MATCH ()-[r]-() DELETE r")
+                # Then delete all nodes
+                session.run("MATCH (n) DELETE n")
+                print("All Neo4j data has been cleared")
+                return True
+        except Exception as e:
+            print(f"Failed to clear Neo4j data: {e}")
+            return False
+    
+    def clear_document_data(self, filename):
+        """
+        Clear data related to a specific document from the Neo4j database.
+        This removes Document nodes matching the filename and related relationships.
+        
+        Args:
+            filename: Name of the document file to clear
+            
+        Returns:
+            bool: Success status
+        """
+        if not self.driver:
+            print("No Neo4j connection available.")
+            return False
+            
+        try:
+            with self.driver.session() as session:
+                # Find Document nodes with matching filename
+                result = session.run(
+                    "MATCH (d:Document) WHERE d.filename = $filename RETURN count(d) as count",
+                    filename=filename
+                )
+                count = result.single()["count"]
+                
+                if count == 0:
+                    print(f"No documents found with filename: {filename}")
+                    return False
+                
+                # Delete relationships connected to document nodes
+                session.run(
+                    "MATCH (d:Document)-[r]-() WHERE d.filename = $filename DELETE r",
+                    filename=filename
+                )
+                
+                # Delete document nodes
+                result = session.run(
+                    "MATCH (d:Document) WHERE d.filename = $filename DELETE d RETURN count(d) as deleted",
+                    filename=filename
+                )
+                deleted = result.single()["deleted"]
+                
+                print(f"Cleared data for document '{filename}': {deleted} nodes removed")
+                return True
+        except Exception as e:
+            print(f"Failed to clear document data: {e}")
+            return False
     
     def create_entity(self, entity_type, name, properties=None):
         """
@@ -305,293 +379,130 @@ class Neo4jConnector:
             return result.single()
 
 class FaissEmbedder:
-    """
-    A class for embedding and storing unstructured data using FAISS.
-    Replaces ChromaDB for the ingestion part.
-    """
-    
-    def __init__(self, 
-                api_key: str, 
-                base_path: str = "faiss_dbs", 
-                embedding_model: str = "mistral-embed",
-                neo4j_uri: str = "neo4j+s://d4e98294.databases.neo4j.io",
-                neo4j_user: str = "neo4j",
-                neo4j_password: str = "CMB2JFluGdYmo5kNG2x7qeAA8krSJK32GTgAJogmYdA"):
-        """
-        Initialize the FAISS embedder.
-        
-        Args:
-            api_key: Mistral API key
-            base_path: Base directory to store FAISS indices
-            embedding_model: Name of the embedding model to use
-            neo4j_uri: Neo4j server URI
-            neo4j_user: Neo4j username
-            neo4j_password: Neo4j password
-        """
-        self.api_key = api_key
+    def __init__(
+        self,
+        api_key: str,
+        base_path: str = "faiss_dbs",
+        model: str = "voyage-3-lite",
+        neo4j_uri: str = None,
+        neo4j_user: str = None,
+        neo4j_password: str = None
+    ):
         self.base_path = base_path
-        self.embedding_model = embedding_model
-        self.mistral_client = Mistral(api_key=api_key)
-        
-        # Create base directory if it doesn't exist
+        self.emb_model = model
         os.makedirs(base_path, exist_ok=True)
+        self.voyage_client = voyageai.Client(api_key=voyage_api_key)
+        self.indices: Dict[int, faiss.Index] = {}
+        self.mappings: Dict[int, List[dict]] = {}
         
-        # Track currently loaded indices
-        self.indices = {}
-        self.mappings = {}
-        
-        # Initialize Neo4j connector
-        self.neo4j = Neo4jConnector(neo4j_uri, neo4j_user, neo4j_password)
-        
-        # Create URL store directory
+        # Only initialize Neo4j connection if valid URI is provided
+        if neo4j_uri and neo4j_uri.strip():
+            self.neo4j = Neo4jConnector(neo4j_uri, neo4j_user or '', neo4j_password or '')
+        else:
+            self.neo4j = None
+            print("Neo4j connection not initialized: No valid URI provided")
+            
         self.url_store_path = os.path.join(base_path, "url_store")
         os.makedirs(self.url_store_path, exist_ok=True)
-        
+    
     def __del__(self):
         """Clean up resources."""
         if hasattr(self, 'neo4j') and self.neo4j:
             self.neo4j.close()
-        
+
     def embed_texts(self, texts: List[str], batch_size: int = 32) -> np.ndarray:
         """
-        Embed a list of texts using Mistral API.
+        Embed a list of texts using the Voyage AI API.
         
         Args:
-            texts: List of text strings to embed
-            batch_size: Number of texts to embed in each batch
+            texts: List of texts to embed
+            batch_size: Number of texts to embed at once
             
         Returns:
-            numpy array of embeddings
+            Array of embeddings
         """
-        embeddings = []
-        
-        # Smaller batch size to avoid rate limits
-        batch_size = min(batch_size, 16)
-        
-        # Add delay between batches to avoid rate limits
-        batch_delay = 1.0  # Start with 1 second delay between batches
+        embeds: List[np.ndarray] = []
+        import math
         
         for i in tqdm(range(0, len(texts), batch_size), desc="Embedding texts"):
             batch = texts[i:i + batch_size]
-            
-            # Add retry logic for API failures
-            max_retries = 5  # Increased max retries
-            for attempt in range(max_retries):
+            for attempt in range(5):
                 try:
-                    # Add delay before making API call
-                    time.sleep(batch_delay)
-                    
-                    # Use the correct parameter name 'inputs' as used in retriver.py
-                    response = self.mistral_client.embeddings.create(
-                        model=self.embedding_model,
-                        inputs=batch
+                    resp = self.voyage_client.embed(
+                        texts=batch,
+                        model=self.emb_model,
+                        input_type="document"
                     )
-                    
-                    # Extract embeddings from response
-                    batch_embeddings = [item.embedding for item in response.data]
-                    embeddings.extend(batch_embeddings)
-                    
-                    # If successful, we can slightly decrease the delay (but keep a minimum)
-                    batch_delay = max(1.0, batch_delay * 0.9)
+                    embeds.extend(resp.embeddings)
                     break
-                    
                 except Exception as e:
-                    error_message = str(e)
-                    print(f"Embedding attempt {attempt+1} failed: {error_message}")
-                    
-                    # If rate limited, increase delay with exponential backoff
-                    if "429" in error_message or "rate limit" in error_message.lower():
-                        # Exponential backoff: 2^attempt seconds
-                        retry_delay = min(60, 2 ** (attempt + 2))  # Max 60 second delay
-                        batch_delay = min(60, batch_delay * 2)  # Double the delay between batches
-                        print(f"Rate limit hit. Waiting {retry_delay}s and increasing batch delay to {batch_delay}s")
-                        time.sleep(retry_delay)
-                    else:
-                        # For other errors, wait a shorter time
-                        time.sleep(2 * (attempt + 1))
-                    
-                    if attempt == max_retries - 1:
-                        raise
+                    # Use exponential backoff
+                    backoff_time = 0.1 * math.pow(2, attempt)
+                    print(f"Embedding retry {attempt+1}/5 failed: {e}. Waiting {backoff_time:.2f}s")
+                    time.sleep(backoff_time)
+                    if attempt == 4:
+                        print(f"Failed to embed batch after 5 retries")
+                        # Return dummy embeddings to prevent complete failure
+                        dummy_size = 1024  # Voyage embedding size
+                        embeds.extend([np.zeros(dummy_size) for _ in batch])
         
-        return np.array(embeddings, dtype="float32")
-    
-    def create_index(self, group_id: int, texts: List[str], metadata: List[Dict] = None) -> None:
-        """
-        Create a FAISS index for a group of texts.
-        
-        Args:
-            group_id: Identifier for the group
-            texts: List of text chunks to index
-            metadata: Optional metadata for each text chunk
-        """
-        if not texts:
-            print(f"No texts provided for group {group_id}")
-            return
-        
-        # Create directory for this group if it doesn't exist
-        group_dir = os.path.join(self.base_path, f"group_{group_id}")
-        os.makedirs(group_dir, exist_ok=True)
-        
-        # Generate embeddings
-        embeddings = self.embed_texts(texts)
-        
-        # Create FAISS index
-        dimension = embeddings.shape[1]
-        
-        # Choose index type based on corpus size
-        if len(texts) > 10000:
-            # For large corpora, use HNSW index which is more efficient for search
-            index = faiss.IndexHNSWFlat(dimension, 32)  # 32 connections per node
-        else:
-            # For smaller corpora, use flat index which is exact but slower for large datasets
-            index = faiss.IndexFlatL2(dimension)
-        
-        # Add embeddings to index
-        index.add(embeddings)
-        
-        # Save index
-        index_path = os.path.join(group_dir, "index.faiss")
-        faiss.write_index(index, index_path)
-        
-        # Create and save mapping (text -> id)
-        if metadata is None:
-            metadata = [{"id": i, "text": text} for i, text in enumerate(texts)]
-        else:
-            # Ensure each metadata entry has 'id' and 'text' fields
-            for i, (meta, text) in enumerate(zip(metadata, texts)):
-                meta["id"] = i
-                meta["text"] = text
-        
-        mapping_path = os.path.join(group_dir, "mapping.pkl")
-        with open(mapping_path, "wb") as f:
-            pickle.dump(metadata, f)
-        
-        # Also save text content separately for easy access
-        texts_path = os.path.join(group_dir, "texts.pkl")
-        with open(texts_path, "wb") as f:
-            pickle.dump(texts, f)
-        
-        print(f"Created FAISS index for group {group_id} with {len(texts)} texts")
-        
-        # Store in memory for immediate use
-        self.indices[group_id] = index
-        self.mappings[group_id] = metadata
-    
-    def load_index(self, group_id: int) -> Tuple[Any, List[Dict]]:
-        """
-        Load a FAISS index for a group.
-        
-        Args:
-            group_id: Identifier for the group
-            
-        Returns:
-            Tuple of (FAISS index, mapping dictionary)
-        """
-        if group_id in self.indices and group_id in self.mappings:
-            return self.indices[group_id], self.mappings[group_id]
-        
-        group_dir = os.path.join(self.base_path, f"group_{group_id}")
-        
-        if not os.path.exists(group_dir):
-            raise FileNotFoundError(f"No index found for group {group_id}")
-        
-        # Load index
-        index_path = os.path.join(group_dir, "index.faiss")
-        index = faiss.read_index(index_path)
-        
-        # Load mapping
-        mapping_path = os.path.join(group_dir, "mapping.pkl")
-        with open(mapping_path, "rb") as f:
-            mapping = pickle.load(f)
-        
-        # Store in memory for future use
-        self.indices[group_id] = index
-        self.mappings[group_id] = mapping
-        
-        return index, mapping
-    
-    def search(self, group_id: int, query: str, k: int = 5) -> List[Dict]:
-        """
-        Search a group for similar texts.
-        
-        Args:
-            group_id: Identifier for the group
-            query: Query text
-            k: Number of results to return
-            
-        Returns:
-            List of dictionaries with search results
-        """
-        # Load index and mapping if not already loaded
-        try:
-            index, mapping = self.load_index(group_id)
-        except FileNotFoundError:
-            print(f"No index found for group {group_id}")
-            return []
-        
-        # Embed query
-        query_embedding = self.embed_texts([query])[0].reshape(1, -1)
-        
-        # Search
-        distances, indices = index.search(query_embedding, k)
-        
-        # Format results
-        results = []
-        for i, idx in enumerate(indices[0]):
-            if idx < len(mapping):
-                result = mapping[idx].copy()
-                result["distance"] = float(distances[0][i])
-                results.append(result)
-        
-        return results
-    
-    def delete_index(self, group_id: int) -> bool:
-        """
-        Delete a FAISS index for a group.
-        
-        Args:
-            group_id: Identifier for the group
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        group_dir = os.path.join(self.base_path, f"group_{group_id}")
-        
-        if not os.path.exists(group_dir):
-            print(f"No index found for group {group_id}")
-            return False
-        
-        # Remove from memory
-        if group_id in self.indices:
-            del self.indices[group_id]
-        
-        if group_id in self.mappings:
-            del self.mappings[group_id]
-        
-        # Delete directory
-        try:
-            for file in os.listdir(group_dir):
-                os.remove(os.path.join(group_dir, file))
-            os.rmdir(group_dir)
-            return True
-        except Exception as e:
-            print(f"Error deleting index for group {group_id}: {str(e)}")
-            return False
-    
-    def get_all_groups(self) -> List[int]:
-        """
-        Get a list of all group IDs.
-        
-        Returns:
-            List of group IDs
-        """
-        groups = []
-        for item in os.listdir(self.base_path):
-            if item.startswith("group_") and os.path.isdir(os.path.join(self.base_path, item)):
-                group_id = int(item.replace("group_", ""))
-                groups.append(group_id)
-        return groups
+        return np.array(embeds, dtype=np.float32)
 
+    def create_index(self, gid: int, texts: List[str], meta: List[dict] = None) -> None:
+        if not texts:
+            print(f"No texts for group {gid}")
+            return
+        group_dir = os.path.join(self.base_path, f"group_{gid}")
+        os.makedirs(group_dir, exist_ok=True)
+        embeddings = self.embed_texts(texts)
+        dim = embeddings.shape[1]
+        index = faiss.IndexHNSWFlat(dim, 32) if len(texts) > 10000 else faiss.IndexFlatL2(dim)
+        index.add(embeddings)
+        faiss.write_index(index, os.path.join(group_dir, "index.faiss"))
+        mapping = []
+        for i, text in enumerate(texts):
+            entry = (meta[i] if meta else {}).copy()
+            entry.update({"id": i, "text": text})
+            mapping.append(entry)
+        with open(os.path.join(group_dir, "mapping.pkl"), 'wb') as f:
+            pickle.dump(mapping, f)
+        self.indices[gid] = index
+        self.mappings[gid] = mapping
+
+    def load_index(self, gid: int) -> Tuple[faiss.Index, List[dict]]:
+        if gid in self.indices:
+            return self.indices[gid], self.mappings[gid]
+        group_dir = os.path.join(self.base_path, f"group_{gid}")
+        index = faiss.read_index(os.path.join(group_dir, "index.faiss"))
+        with open(os.path.join(group_dir, "mapping.pkl"), 'rb') as f:
+            mapping = pickle.load(f)
+        self.indices[gid] = index
+        self.mappings[gid] = mapping
+        return index, mapping
+
+    def search(self, gid: int, query: str, k: int = 5) -> List[dict]:
+        index, mapping = self.load_index(gid)
+        query_emb = self.embed_texts([query])[0].reshape(1, -1)
+        dists, ids = index.search(query_emb, k)
+        results: List[dict] = []
+        for dist, idx in zip(dists[0], ids[0]):
+            if idx < len(mapping):
+                item = mapping[idx].copy()
+                item['distance'] = float(dist)
+                results.append(item)
+        return results
+
+    def delete_index(self, gid: int) -> None:
+        group_dir = os.path.join(self.base_path, f"group_{gid}")
+        if os.path.isdir(group_dir):
+            for fn in os.listdir(group_dir):
+                os.remove(os.path.join(group_dir, fn))
+            os.rmdir(group_dir)
+        self.indices.pop(gid, None)
+        self.mappings.pop(gid, None)
+
+    def get_all_groups(self) -> List[int]:
+        return [int(d.split('_')[1]) for d in os.listdir(self.base_path) if d.startswith('group_')]
     def extract_entities(self, text: str) -> Dict[str, List[str]]:
         """
         Extract named entities from text using spaCy.
@@ -839,19 +750,25 @@ def format_urls_in_content(content: str) -> str:
 def index_chunks(chunks: List[Chunk], 
                 api_key: str = None, 
                 base_path: str = "faiss_dbs",
-                neo4j_uri: str = "neo4j+s://d4e98294.databases.neo4j.io",
+                neo4j_uri: str = None,
                 neo4j_user: str = "neo4j",
-                neo4j_password: str = "CMB2JFluGdYmo5kNG2x7qeAA8krSJK32GTgAJogmYdA") -> None:
+                neo4j_password: str = "CMB2JFluGdYmo5kNG2x7qeAA8krSJK32GTgAJogmYdA",
+                process_urls: bool = True,
+                process_entities: bool = True,
+                minimal_processing: bool = False) -> None:
     """
     Index a list of chunks using FAISS, spaCy for entity extraction, and Neo4j.
     
     Args:
         chunks: List of chunk dictionaries
-        api_key: Mistral API key
+        api_key: API key for embeddings
         base_path: Base directory for FAISS indices
-        neo4j_uri: Neo4j connection URI
+        neo4j_uri: Neo4j connection URI (None to disable Neo4j)
         neo4j_user: Neo4j username
         neo4j_password: Neo4j password
+        process_urls: Whether to process URLs (can be disabled for speed)
+        process_entities: Whether to extract entities (can be disabled for speed)
+        minimal_processing: If True, only creates FAISS indexes without entity/URL processing
     """
     if not chunks:
         print("No chunks to index")
@@ -866,11 +783,24 @@ def index_chunks(chunks: List[Chunk],
         neo4j_password=neo4j_password
     )
     
-    # Ensure all chunks have URLs formatted correctly
-    for chunk in chunks:
-        if 'content' in chunk:
-            chunk['content'] = extract_info_url(chunk['content'])
-            chunk['content'] = format_urls_in_content(chunk['content'])
+    # For small documents (less than 20 chunks), disable entity processing unless explicitly requested
+    is_small_document = len(chunks) < 20
+    if is_small_document and process_entities:
+        print(f"Small document detected ({len(chunks)} chunks). Consider using minimal_processing=True for faster indexing.")
+    
+    # Skip URL processing if disabled or in minimal processing mode
+    if process_urls and not minimal_processing:
+        from concurrent.futures import ThreadPoolExecutor
+        
+        def process_chunk_urls(chunk):
+            if 'content' in chunk:
+                chunk['content'] = extract_info_url(chunk['content'])
+                chunk['content'] = format_urls_in_content(chunk['content'])
+            return chunk
+        
+        # Process URLs in parallel
+        with ThreadPoolExecutor(max_workers=min(50, len(chunks))) as executor:
+            chunks = list(executor.map(process_chunk_urls, chunks))
     
     # Group chunks by level
     section_chunks = [c for c in chunks if c['level'] == 'section']
@@ -894,39 +824,121 @@ def index_chunks(chunks: List[Chunk],
         print(f"Indexing {len(paragraph_chunks)} paragraph chunks with group ID {group_id}")
         embedder.create_index(group_id, paragraph_texts, paragraph_chunks)
     
-    # Process each chunk for entity extraction and URL crawling
-    for chunk in tqdm(chunks, desc="Processing entities and URLs"):
-        # Skip if no content
+    # Skip entity extraction and Neo4j operations if in minimal processing mode
+    if minimal_processing:
+        print("Minimal processing enabled - skipping entity extraction and Neo4j operations")
+        return
+    
+    # Skip entity extraction if disabled or document is small and auto-optimization is enabled
+    if not process_entities or (is_small_document and not process_entities):
+        print("Entity extraction disabled - skipping entity and Neo4j processing")
+        return
+        
+    # Process entities in batches
+    from concurrent.futures import ThreadPoolExecutor
+    batch_size = 64  # Increased batch size for performance
+    
+    # Define a function to process a single chunk
+    def process_chunk(chunk):
         if not chunk.get('content'):
+            return None
+        
+        # Extract entities (if enabled)
+        entities = embedder.extract_entities(chunk['content']) if process_entities else {}
+        
+        # Extract URLs (if enabled)
+        urls = embedder.extract_urls(chunk['content']) if process_urls else []
+        
+        return {
+            'chunk_id': chunk['id'],
+            'entities': entities,
+            'urls': urls,
+            'chunk': chunk
+        }
+    
+    # Process chunks in batches
+    for i in tqdm(range(0, len(chunks), batch_size), desc="Processing entities and URLs"):
+        batch = chunks[i:i+batch_size]
+        
+        # Process entities and URLs in parallel
+        with ThreadPoolExecutor(max_workers=min(batch_size, len(batch))) as executor:
+            results = list(executor.map(process_chunk, batch))
+        
+        # Filter out None results
+        results = [r for r in results if r]
+        
+        # Skip Neo4j operations if no results
+        if not results:
             continue
+            
+        # Prepare bulk operations
+        all_chunk_ids = []
+        all_chunks = []
+        all_entities = []
+        all_urls = []
         
-        # Extract entities
-        entities = embedder.extract_entities(chunk['content'])
+        # Collect all data for bulk operations
+        for result in results:
+            chunk_id = result['chunk_id']
+            chunk = result['chunk']
+            
+            all_chunk_ids.append(chunk_id)
+            all_chunks.append(chunk)
+            
+            for entity_type, entity_names in result['entities'].items():
+                for entity_name in entity_names:
+                    all_entities.append((entity_type, entity_name, chunk_id))
+            
+            if process_urls:
+                for url in result['urls']:
+                    context = {
+                        'chunk_id': chunk_id,
+                        'filename': chunk['filename'],
+                        'title': chunk.get('title', ''),
+                        'level': chunk['level']
+                    }
+                    all_urls.append((url, context))
         
-        # Store chunk in Neo4j
-        chunk_id = chunk['id']
-        embedder.neo4j.store_chunk(chunk_id, chunk)
-        
-        # Process entities and add to Neo4j
-        for entity_type, entity_names in entities.items():
-            for entity_name in entity_names:
-                # Create entity
-                embedder.neo4j.create_entity(entity_type, entity_name)
+        # Perform Neo4j operations in bulk where possible
+        try:
+            # Only perform Neo4j operations if Neo4j is connected
+            if embedder.neo4j and embedder.neo4j.driver:
+                # Store chunks in Neo4j - still one at a time but in a batch
+                for chunk_id, chunk in zip(all_chunk_ids, all_chunks):
+                    embedder.neo4j.store_chunk(chunk_id, chunk)
                 
-                # Link entity to chunk
-                embedder.neo4j.link_entity_to_chunk(entity_type, entity_name, chunk_id)
-        
-        # Extract and store URLs
-        # Both normal URLs and those in <<url>> format will be extracted
-        urls = embedder.extract_urls(chunk['content'])
-        for url in urls:
-            context = {
-                'chunk_id': chunk_id,
-                'filename': chunk['filename'],
-                'title': chunk.get('title', ''),
-                'level': chunk['level']
-            }
-            embedder.store_url(url, context)
+                # Process entities using batch operations where possible
+                if embedder.neo4j.driver and all_entities:
+                    with embedder.neo4j.driver.session() as session:
+                        # First create all entities in a single query
+                        entity_types = list(set(e[0] for e in all_entities))
+                        for entity_type in entity_types:
+                            entities_of_type = [e[1] for e in all_entities if e[0] == entity_type]
+                            if entities_of_type:
+                                # Create entities of this type
+                                query = (
+                                    f"UNWIND $entities AS entity "
+                                    f"MERGE (e:{entity_type} {{name: entity, id: apoc.util.md5([entity, '{entity_type}'])}})"
+                                    f" RETURN count(e) as count"
+                                )
+                                try:
+                                    session.run(query, entities=list(set(entities_of_type)))
+                                except Exception as e:
+                                    print(f"Error creating entities: {e}")
+                                    # Fall back to individual entity creation
+                                    for entity_name in entities_of_type:
+                                        embedder.neo4j.create_entity(entity_type, entity_name)
+                        
+                        # Then link entities to chunks
+                        for entity_type, entity_name, chunk_id in all_entities:
+                            embedder.neo4j.link_entity_to_chunk(entity_type, entity_name, chunk_id)
+            
+            # Store URLs
+            if process_urls and all_urls:
+                for url, context in all_urls:
+                    embedder.store_url(url, context)
+        except Exception as e:
+            print(f"Error performing Neo4j operations: {e}")
     
     print(f"Indexed {len(chunks)} chunks with entity extraction and URL processing")
     # Return the formatted content of the first chunk for reference
@@ -1124,7 +1136,7 @@ def retrieve_from_structured(query: str, db_path: str = None,
         results['entities'] = entities
         
         # If we have Neo4j connected, try to find related documents for each entity
-        if embedder.neo4j.driver:
+        if embedder.neo4j and embedder.neo4j.driver:
             try:
                 for entity_type, entity_names in entities.items():
                     for entity_name in entity_names:
@@ -1138,25 +1150,20 @@ def retrieve_from_structured(query: str, db_path: str = None,
                             )
                             
                             records = session.run(query, entity_name=entity_name)
+                            
+                            # Process results
                             for record in records:
-                                # Add this document to the results
-                                doc_id = record["d.id"]
-                                doc_data = {
-                                    "id": doc_id,
-                                    "filename": record["d.filename"],
-                                    "title": record["d.title"],
-                                    "level": record["d.level"],
-                                    "matched_entity": entity_name,
-                                    "entity_type": entity_type
+                                doc_info = {
+                                    'filename': record['d.filename'],
+                                    'title': record['d.title'],
+                                    'level': record['d.level'],
+                                    'entity_match': entity_name,
+                                    'entity_type': entity_type,
+                                    'source': 'neo4j'
                                 }
                                 
-                                # Add to appropriate result list
-                                if record["d.level"] == "section":
-                                    if doc_data not in results['sections']:
-                                        results['sections'].append(doc_data)
-                                elif record["d.level"] == "paragraph":
-                                    if doc_data not in results['paragraphs']:
-                                        results['paragraphs'].append(doc_data)
+                                if doc_info not in results['entities']:
+                                    results['entities'].append(doc_info)
             except Exception as e:
                 print(f"Error querying Neo4j for entities: {e}")
     

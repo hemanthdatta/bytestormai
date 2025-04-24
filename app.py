@@ -17,7 +17,20 @@ def allowed_file(filename):
 
 @app.route('/')
 def index():
-    return render_template('index.html')
+    # Get list of uploaded files to display in UI
+    uploaded_files = []
+    if os.path.exists(app.config['UPLOAD_FOLDER']):
+        for filename in os.listdir(app.config['UPLOAD_FOLDER']):
+            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            if os.path.isfile(filepath):
+                filesize = os.path.getsize(filepath)
+                uploaded_files.append({
+                    'name': filename,
+                    'path': filepath,
+                    'size': filesize
+                })
+    
+    return render_template('index.html', uploaded_files=uploaded_files)
 
 @app.route('/upload', methods=['POST'])
 def upload_files():
@@ -36,12 +49,15 @@ def upload_files():
     uploaded_paths = []
     document_paths = []
     structured_paths = []
+    file_details = []
     
     for file in files:
         if file and allowed_file(file.filename):
             filename = secure_filename(file.filename)
             filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
             file.save(filepath)
+            filesize = os.path.getsize(filepath)
+            
             uploaded_paths.append(filepath)
             
             # Categorize files
@@ -50,18 +66,68 @@ def upload_files():
                 structured_paths.append(filepath)
             else:
                 document_paths.append(filepath)
+                
+            # Add file details for UI
+            file_details.append({
+                'name': filename,
+                'path': filepath,
+                'size': filesize,
+                'type': 'structured' if ext in ['csv', 'xlsx', 'json'] else 'document'
+            })
     
     # Process files with the main module
     if document_paths:
-        main.ingest_documents(document_paths)
+        try:
+            main.minimal_ingest_documents(document_paths)
+        except Exception as e:
+            print(f"Error ingesting documents: {e}")
+            return jsonify({'error': f'Document processing error: {str(e)}'}), 500
     
     if structured_paths:
-        main.ingest_structured(structured_paths)
+        try:
+            main.ingest_structured(structured_paths)
+        except Exception as e:
+            print(f"Error ingesting structured data: {e}")
+            return jsonify({'error': f'Structured data processing error: {str(e)}'}), 500
     
     return jsonify({
         'message': f'Successfully uploaded {len(uploaded_paths)} files',
-        'uploads': uploaded_paths
+        'uploads': uploaded_paths,
+        'file_details': file_details
     })
+
+@app.route('/delete-file', methods=['POST'])
+def delete_file():
+    data = request.json
+    if not data or 'filepath' not in data:
+        return jsonify({'error': 'No filepath provided'}), 400
+    
+    filepath = data['filepath']
+    filename = os.path.basename(filepath)
+    
+    # Security check to ensure we only delete files in the upload folder
+    if not os.path.normpath(filepath).startswith(os.path.normpath(app.config['UPLOAD_FOLDER'])):
+        return jsonify({'error': 'Invalid filepath'}), 403
+    
+    try:
+        # Delete the file
+        if os.path.exists(filepath):
+            os.remove(filepath)
+            
+            # Clean up from memory
+            try:
+                main.remove_from_memory(filepath)
+            except Exception as e:
+                print(f"Error removing from memory: {e}")
+            
+            return jsonify({
+                'message': f'Successfully deleted {filename}',
+                'deleted': filepath
+            })
+        else:
+            return jsonify({'error': f'File {filename} not found'}), 404
+    except Exception as e:
+        return jsonify({'error': f'Error deleting file: {str(e)}'}), 500
 
 @app.route('/query', methods=['POST'])
 def query():
@@ -77,9 +143,5 @@ def query():
         'question': question
     })
 
-@app.route('/health')
-def health_check():
-    return jsonify({'status': 'healthy'})
-
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8000, debug=True) 
+    app.run(host='0.0.0.0', port=5000, debug=True) 

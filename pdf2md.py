@@ -1,4 +1,3 @@
-
 # pdf_to_markdown_and_summary_concurrent.py
 
 import fitz  # PyMuPDF
@@ -15,7 +14,6 @@ import time
 import threading
 import hashlib
 from collections import Counter
-import camelot
 
 #########################
 # Global Rate Limiter Variables
@@ -99,29 +97,9 @@ def get_heading_thresholds(font_counter):
 
 def extract_tables_with_camelot(pdf_path, page_num, table_images_dir, io_lock):
     """
-    Use Camelot to extract tables from the given page.
-    Returns a markdown string with tables as both markdown and images.
+    Stub function that no longer extracts tables.
     """
-    md = ""
-    try:
-        tables = camelot.read_pdf(pdf_path, pages=str(page_num + 1), flavor='stream')
-        if tables:
-            md += "### Tables\n\n"
-        for idx, table in enumerate(tables):
-            df = table.df
-            md += f"#### Table {idx+1}\n\n"
-            md += df.to_markdown(index=False) + "\n\n"
-
-            # save table as image
-            img_filename = f"page_{page_num+1}_table_{idx+1}.png"
-            img_path = os.path.join(table_images_dir, img_filename)
-            with io_lock:
-                table.to_image(img_path)
-            md += f"![Table {idx+1}](table_images/{img_filename})\n\n"
-
-    except Exception as e:
-        md += f"**Error extracting tables on page {page_num+1}:** {e}\n\n"
-    return md
+    return ""
 
 def generate_md(pdf_path, api_key, output_file=None, max_workers=4):
     """
@@ -194,8 +172,7 @@ def generate_md(pdf_path, api_key, output_file=None, max_workers=4):
                 except Exception as e:
                     md += f"**Text extraction error:** {e}\n\n"
 
-                # — Table Extraction via Camelot —
-                md += extract_tables_with_camelot(pdf_path, page_num, table_images_dir, io_lock)
+                # — Table Extraction has been removed —
 
                 # — Image Extraction & OCR —
                 try:
