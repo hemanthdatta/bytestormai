@@ -135,13 +135,21 @@ def query():
     if not data or 'question' not in data:
         return jsonify({'error': 'No question provided'}), 400
     
-    question = data['question']
-    result = main.pipeline.invoke({'question': question})
-    
-    return jsonify({
-        'answer': result.get('answer', 'Sorry, I could not find an answer.'),
-        'question': question
-    })
+    try:
+        # Clear the query embedding cache to ensure fresh embeddings for new queries
+        import faiss_embedder
+        faiss_embedder.clear_query_cache()
+        
+        question = data['question']
+        result = main.pipeline.invoke({'question': question})
+        
+        return jsonify({
+            'answer': result.get('answer', 'Sorry, I could not find an answer.'),
+            'question': question
+        })
+    except Exception as e:
+        print(f"Error processing query: {e}")
+        return jsonify({'error': f'Error processing query: {str(e)}'}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True) 

@@ -37,6 +37,9 @@ MD_URL_REGEX = r'<<(https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+)>>'
 SIMPLIFIED_URL = r'<<.*?>>'
 DB_PATH = "url_cache.db"
 
+# Add a global query embedding cache
+QUERY_EMBEDDING_CACHE = {}
+
 # Initialize spaCy
 try:
     nlp = spacy.load("en_core_web_sm")
@@ -410,17 +413,26 @@ class FaissEmbedder:
         if hasattr(self, 'neo4j') and self.neo4j:
             self.neo4j.close()
 
-    def embed_texts(self, texts: List[str], batch_size: int = 32) -> np.ndarray:
+    def embed_texts(self, texts: List[str], batch_size: int = 32, is_query: bool = False) -> np.ndarray:
         """
         Embed a list of texts using the Voyage AI API.
         
         Args:
             texts: List of texts to embed
             batch_size: Number of texts to embed at once
+            is_query: Whether this is a query text (for caching)
             
         Returns:
             Array of embeddings
         """
+        # Check cache for query texts
+        if is_query and len(texts) == 1:
+            query_text = texts[0]
+            cache_key = f"{query_text}_{self.emb_model}"
+            if cache_key in QUERY_EMBEDDING_CACHE:
+                print(f"Using cached embedding for query: {query_text[:30]}...")
+                return QUERY_EMBEDDING_CACHE[cache_key]
+        
         embeds: List[np.ndarray] = []
         import math
         
@@ -446,7 +458,15 @@ class FaissEmbedder:
                         dummy_size = 1024  # Voyage embedding size
                         embeds.extend([np.zeros(dummy_size) for _ in batch])
         
-        return np.array(embeds, dtype=np.float32)
+        result = np.array(embeds, dtype=np.float32)
+        
+        # Cache the result for query texts
+        if is_query and len(texts) == 1:
+            query_text = texts[0]
+            cache_key = f"{query_text}_{self.emb_model}"
+            QUERY_EMBEDDING_CACHE[cache_key] = result
+        
+        return result
 
     def create_index(self, gid: int, texts: List[str], meta: List[dict] = None) -> None:
         if not texts:
@@ -482,7 +502,7 @@ class FaissEmbedder:
 
     def search(self, gid: int, query: str, k: int = 5) -> List[dict]:
         index, mapping = self.load_index(gid)
-        query_emb = self.embed_texts([query])[0].reshape(1, -1)
+        query_emb = self.embed_texts([query], is_query=True)[0].reshape(1, -1)
         dists, ids = index.search(query_emb, k)
         results: List[dict] = []
         for dist, idx in zip(dists[0], ids[0]):
@@ -1002,6 +1022,9 @@ def section_faiss_search(query: str, k: int = 5,
     # Get all available groups
     groups = embedder.get_all_groups()
     
+    # Embed query once instead of for each group - mark as query for caching
+    query_embedding = embedder.embed_texts([query], is_query=True)[0].reshape(1, -1)
+    
     all_results = []
     for group_id in groups:
         try:
@@ -1012,8 +1035,7 @@ def section_faiss_search(query: str, k: int = 5,
             has_sections = any(m.get('level') == 'section' for m in mapping if isinstance(m, dict))
             
             if has_sections:
-                # Embed query
-                query_embedding = embedder.embed_texts([query])[0].reshape(1, -1)
+                # Use the pre-computed query embedding
                 
                 # Search
                 distances, indices = index.search(query_embedding, k)
@@ -1055,6 +1077,9 @@ def paragraph_faiss_search(query: str, k: int = 5,
     # Get all available groups
     groups = embedder.get_all_groups()
     
+    # Embed query once instead of for each group - mark as query for caching
+    query_embedding = embedder.embed_texts([query], is_query=True)[0].reshape(1, -1)
+    
     all_results = []
     for group_id in groups:
         try:
@@ -1065,8 +1090,7 @@ def paragraph_faiss_search(query: str, k: int = 5,
             has_paragraphs = any(m.get('level') == 'paragraph' for m in mapping if isinstance(m, dict))
             
             if has_paragraphs:
-                # Embed query
-                query_embedding = embedder.embed_texts([query])[0].reshape(1, -1)
+                # Use the pre-computed query embedding
                 
                 # Search
                 distances, indices = index.search(query_embedding, k)
@@ -1114,15 +1138,79 @@ def retrieve_from_structured(query: str, db_path: str = None,
         'entities': []
     }
     
+    # Create embedder once to reuse for all operations
+    embedder = FaissEmbedder(api_key=api_key, base_path=base_path)
+    
     # Get sections and paragraphs from FAISS
     try:
-        results['sections'] = section_faiss_search(query, k=3, api_key=api_key, base_path=base_path)
-        results['paragraphs'] = paragraph_faiss_search(query, k=5, api_key=api_key, base_path=base_path)
+        # Get all available groups
+        groups = embedder.get_all_groups()
+        
+        # Embed query once for all searches - mark as query for caching
+        query_embedding = embedder.embed_texts([query], is_query=True)[0].reshape(1, -1)
+        
+        # Search for sections
+        section_results = []
+        for group_id in groups:
+            try:
+                # Load index and mapping for this group
+                index, mapping = embedder.load_index(group_id)
+                
+                # Check if this index contains section-level chunks
+                has_sections = any(m.get('level') == 'section' for m in mapping if isinstance(m, dict))
+                
+                if has_sections:
+                    # Search
+                    distances, indices = index.search(query_embedding, 3)  # k=3 for sections
+                    
+                    # Filter and format results
+                    for i, idx in enumerate(indices[0]):
+                        if idx < len(mapping):
+                            result = mapping[idx].copy()
+                            # Only include section-level chunks
+                            if result.get('level') == 'section':
+                                result["distance"] = float(distances[0][i])
+                                result["group_id"] = group_id
+                                section_results.append(result)
+            except Exception as e:
+                print(f"Error searching group {group_id} for sections: {e}")
+        
+        # Sort section results by distance
+        section_results.sort(key=lambda x: x.get('distance', float('inf')))
+        results['sections'] = section_results[:3]  # Top 3 sections
+        
+        # Search for paragraphs
+        paragraph_results = []
+        for group_id in groups:
+            try:
+                # Load index and mapping for this group
+                index, mapping = embedder.load_index(group_id)
+                
+                # Check if this index contains paragraph-level chunks
+                has_paragraphs = any(m.get('level') == 'paragraph' for m in mapping if isinstance(m, dict))
+                
+                if has_paragraphs:
+                    # Search
+                    distances, indices = index.search(query_embedding, 5)  # k=5 for paragraphs
+                    
+                    # Filter and format results
+                    for i, idx in enumerate(indices[0]):
+                        if idx < len(mapping):
+                            result = mapping[idx].copy()
+                            # Only include paragraph-level chunks
+                            if result.get('level') == 'paragraph':
+                                result["distance"] = float(distances[0][i])
+                                result["group_id"] = group_id
+                                paragraph_results.append(result)
+            except Exception as e:
+                print(f"Error searching group {group_id} for paragraphs: {e}")
+        
+        # Sort paragraph results by distance
+        paragraph_results.sort(key=lambda x: x.get('distance', float('inf')))
+        results['paragraphs'] = paragraph_results[:5]  # Top 5 paragraphs
+        
     except Exception as e:
         print(f"Error retrieving from FAISS: {e}")
-    
-    # Create embedder to access Neo4j
-    embedder = FaissEmbedder(api_key=api_key, base_path=base_path)
     
     # Extract entities from the query using spaCy
     if nlp:
@@ -1232,3 +1320,10 @@ def retrieve_from_structured(query: str, db_path: str = None,
             print(f"Error retrieving from structured data: {e}")
     
     return results 
+
+def clear_query_cache():
+    """Clear the query embedding cache."""
+    global QUERY_EMBEDDING_CACHE
+    old_size = len(QUERY_EMBEDDING_CACHE)
+    QUERY_EMBEDDING_CACHE.clear()
+    print(f"Cleared query cache: removed {old_size} cached embeddings") 

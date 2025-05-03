@@ -1,4 +1,3 @@
-
 import os
 import re
 import time
@@ -12,6 +11,7 @@ import docx2md
 import pptx2md
 import img2md
 import faiss_embedder
+import uuid
 from pdf2md import summarize_markdown_groups
 from anthropic import Anthropic
 from langchain.text_splitter import TokenTextSplitter
@@ -55,34 +55,41 @@ def minimal_ingest_documents(paths):
     # No Neo4j operations in minimal mode
     print("Using minimal processing mode - skipping Neo4j operations")
     
+    file_id_map = {}  # Maps paths to unique IDs
+    
     for idx, path in enumerate(paths):
-        base = str(idx)
-        md_path = os.path.join(dump_path, f"{base}.md")
+        # Create a unique ID for each file using timestamp and UUID
+        unique_id = f"{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        file_id_map[path] = unique_id
+        
+        md_path = os.path.join(dump_path, f"{unique_id}.md")
         
         if path.endswith('.txt'):
-            txt2md.generate_md(path, gemini_api, os.path.join(dump_path, base))
+            txt2md.generate_md(path, gemini_api, os.path.join(dump_path, unique_id))
         elif path.endswith('.pdf'):
-            pdf2md.generate_md(path, gemini_api, os.path.join(dump_path, base))
+            pdf2md.generate_md(path, gemini_api, os.path.join(dump_path, unique_id))
         elif path.endswith('.docx'):
-            docx2md.generate_md(path, gemini_api, os.path.join(dump_path, base))
+            docx2md.generate_md(path, gemini_api, os.path.join(dump_path, unique_id))
         elif path.endswith('.pptx'):
-            pptx2md.generate_md(path, gemini_api, os.path.join(dump_path, base))
+            pptx2md.generate_md(path, gemini_api, os.path.join(dump_path, unique_id))
         else:
-            img2md.generate_md(path, gemini_api, os.path.join(dump_path, base))
+            img2md.generate_md(path, gemini_api, os.path.join(dump_path, unique_id))
             
         # Track the indexed file
         _indexed_files[path] = {
             'md_path': md_path,
             'index_time': time.time(),
-            'original_path': path
+            'original_path': path,
+            'unique_id': unique_id
         }
 
-    for idx in range(len(paths)):
-        md_file = os.path.join(dump_path, f"{idx}.md")
+    for path in paths:
+        unique_id = file_id_map[path]
+        md_file = os.path.join(dump_path, f"{unique_id}.md")
         try:
             with open(md_file, 'r', encoding='utf-8', errors='replace') as f:
                 content = f.read()
-            item = {'filename': os.path.basename(md_file), 'content': content, 'document_number': idx}
+            item = {'filename': os.path.basename(md_file), 'content': content, 'document_number': unique_id}
             chunks = faiss_embedder.chunk_and_index(item)
             
             # Use minimal processing for maximum speed
@@ -126,10 +133,15 @@ def handle_data_queries(df: pd.DataFrame, question: str):
 
 # === Ingestion: Documents ===
 def ingest_documents(paths):
+    file_id_map = {}  # Maps paths to unique IDs
+    
     for idx, path in enumerate(paths):
-        base = str(idx)
-        md_folder = os.path.join(dump_path, base)
-        md_path = os.path.join(dump_path, f"{base}.md")
+        # Create a unique ID for each file using timestamp and UUID
+        unique_id = f"{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        file_id_map[path] = unique_id
+        
+        md_folder = os.path.join(dump_path, unique_id)
+        md_path = os.path.join(dump_path, f"{unique_id}.md")
 
         if path.endswith('.txt'):
             txt2md.generate_md(path, anthropic_api_key, md_folder)
@@ -145,15 +157,17 @@ def ingest_documents(paths):
         _indexed_files[path] = {
             'md_path': md_path,
             'index_time': time.time(),
-            'original_path': path
+            'original_path': path,
+            'unique_id': unique_id
         }
 
-    for idx in range(len(paths)):
-        md_file = os.path.join(dump_path, f"{idx}.md")
+    for path in paths:
+        unique_id = file_id_map[path]
+        md_file = os.path.join(dump_path, f"{unique_id}.md")
         try:
             with open(md_file, 'r', encoding='utf-8', errors='replace') as f:
                 content = f.read()
-            item = { 'filename': os.path.basename(md_file), 'content': content, 'document_number': idx }
+            item = { 'filename': os.path.basename(md_file), 'content': content, 'document_number': unique_id }
             chunks = faiss_embedder.chunk_and_index(item)
             faiss_embedder.index_chunks(chunks, api_key=anthropic_api_key)
             time.sleep(0.5)
@@ -196,7 +210,7 @@ def ingest_structured(file_paths):
             f.write(current_db_path)
 
         anth_agent = ChatAnthropic(
-            model='claude-3-sonnet-20240229',
+            model='claude-3-7-sonnet-latest',
             api_key=anthropic_api_key,
             temperature=0
         )
@@ -274,10 +288,14 @@ def describe_input_data(state):
     try:
         md_files = [f for f in os.listdir(dump_path) if f.endswith('.md')]
         for md in md_files[:3]:
-            txt = open(os.path.join(dump_path, md), 'r', encoding='utf-8', errors='replace')
-            desc.append(txt.read(100).replace('\n', ' '))
-    except:
-        pass
+            try:
+                txt = open(os.path.join(dump_path, md), 'r', encoding='utf-8', errors='replace')
+                desc.append(txt.read(100).replace('\n', ' '))
+            except Exception as e:
+                print(f"Error reading file {md}: {e}")
+    except Exception as e:
+        print(f"Error listing directory {dump_path}: {e}")
+        
     struct_info = []
     if structured_dfs:
         for name, df in zip(structured_names, structured_dfs):
@@ -297,7 +315,7 @@ def classify_node(state):
     ]
     try:
         r = anthropic.messages.create(
-            model="claude-3-haiku-20240307",
+            model="claude-3-7-sonnet-latest",
             system="Classify user queries into route categories.",
             messages=messages,
             max_tokens=50
@@ -314,7 +332,9 @@ def retrieval_node(state):
     route = state['route']
 
     if route == 'ENTITY':
-        state['retrieved'] = faiss_embedder.section_faiss_search(q, api_key=anthropic_api_key)
+        # Use combined retrieval function instead of just section search
+        results = faiss_embedder.retrieve_from_structured(q, api_key=anthropic_api_key)
+        state['retrieved'] = results['sections'] + results['paragraphs']
     elif route == 'DATA':
         df = query_structured_data(q)
         if df.empty and combined_structured_df is not None:
@@ -331,11 +351,13 @@ def retrieval_node(state):
         else:
             state['retrieved'] = df
     else:
-        state['retrieved'] = faiss_embedder.section_faiss_search(q, api_key=anthropic_api_key)
+        # Use combined retrieval function for general queries too
+        results = faiss_embedder.retrieve_from_structured(q, api_key=anthropic_api_key)
+        state['retrieved'] = results['sections'] + results['paragraphs']
 
     return state
 
-def answer_and_fallback_node(state):
+def answer_and_fallback_node(state, retry_count=0):
     if 'agent_answer' in state:
         return {'answer': state.pop('agent_answer')}
 
@@ -348,7 +370,7 @@ def answer_and_fallback_node(state):
     )
     try:
         r = anthropic.messages.create(
-            model="claude-3-sonnet-20240229",
+            model="claude-3-7-sonnet-latest",
             system="Answer user questions using the provided context.",
             messages=[{"role":"user","content":prompt}],
             max_tokens=400
@@ -357,10 +379,10 @@ def answer_and_fallback_node(state):
     except:
         ans = ''
 
-    if not ans or len(ans) < 20 or 'might' in ans.lower():
+    if (not ans or 'might' in ans.lower()) and retry_count < 5:
         state = classify_node(state)
         state = retrieval_node(state)
-        return answer_and_fallback_node(state)
+        return answer_and_fallback_node(state, retry_count + 1)
 
     return {'answer': ans}
 
